@@ -1,0 +1,109 @@
+const express = require("express");
+
+const paymentRouter = express.Router();
+const razorpayInstance = require("../utils/razorpay");
+const { userAuth } = require("../middlewares/auth");
+
+const Payment = require("../model/payment");
+const User = require("../model/user");
+const { membershipAmount } = require("../utils/constants");
+const {
+  validateWebhookSignature,
+} = require("razorpay/dist/utils/razorpay-utils");
+
+function generateReceiptId() {
+  const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  return `RCPT-${date}`;
+}
+
+paymentRouter.post("/payment/create", userAuth, async (req, res) => {
+  try {
+    const { membershipType } = req.body;
+    console.log("req", req);
+    const { _id, firstName, lastName, emailId } = req.user;
+    const order = await razorpayInstance.orders.create({
+      amount: membershipAmount[membershipType] * 100,
+      currency: "INR",
+      receipt: generateReceiptId(),
+      notes: {
+        firstName,
+        lastName,
+        emailId,
+        membershipType: membershipType == "upgrade" ? "gold" : membershipType,
+      },
+    });
+    const payment = new Payment({
+      userId: _id,
+      amount: order.amount,
+      currency: order.currency,
+      notes: order.notes,
+      status: order.status,
+      orderId: order.id,
+      receipt: order.receipt,
+    });
+    const savedPayment = await payment.save();
+    res.json({
+      ...savedPayment.toJSON(),
+      keyId: process.env.RAZOR_PAY_KEY_ID,
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+/* 
+  Payment verification through Webhook, here userAuth verification is not required as razorpay will trigger payment verification.
+  Localhost can't call this, only production build will be allowed.
+  Webhook is created in the razorpay website in accounts and settings.
+*/
+paymentRouter.post("/payment/webhook", async (req, res) => {
+  try {
+    const webhookSignature = req.header("x-razorpay-signature");
+    const isWebhookValid = await validateWebhookSignature(
+      JSON.stringify(req.body),
+      webhookSignature,
+      process.env.RAZOR_PAY_WEB_HOOK_SECRET,
+    );
+
+    if (!isWebhookValid) {
+      return res.status(400).json({ message: "Webhook is not valid" });
+    }
+
+    /* 
+        Update the payment status
+        Update the user status to Premium
+    */
+    const paymentDetails = req.body.payload.payment.entity;
+    const payment = await Payment.findOne({ orderId: paymentDetails.order_id });
+    payment.status = paymentDetails.status;
+    await payment.save();
+
+    const user = await User.findOne({ _id: payment.userId });
+    user.isPremium = true;
+    user.membershipType = payment.notes.membershipType;
+    await user.save();
+
+    /* Any specific task to do after payment is captured or failed */
+    // if (req.body.event == "payment.captured") {
+    // }
+    // if (req.body.event == "payment.failed") {
+    // }
+
+    res.status(200).json({ message: "Webhook received successfully." });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+paymentRouter.get("/premium/verify", userAuth, async (req, res) => {
+  try {
+    const { user } = req;
+    res
+      .status(200)
+      .json({ isPremium: user.isPremium, membershipType: user.membershipType });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+module.exports = paymentRouter;
